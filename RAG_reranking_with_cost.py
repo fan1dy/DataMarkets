@@ -106,10 +106,84 @@ if __name__ == "__main__":
     #                         max_new_tokens=256)
     # print(tokenizer.decode(outputs[0]))
 
-
     # print("++++++++++++++ without RAG")
 
     # input_ids = tokenizer(f"The user's question: {question_def}", return_tensors="pt").to(device)
     # outputs = model.generate(**input_ids,
     #                         max_new_tokens=256)
     # print(tokenizer.decode(outputs[0]))
+
+# 1) Build FAISS index as before:
+def build_vectorstore(docs):
+    embed = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+    return FAISS.from_documents(docs, embedding=embed)
+
+# 2) Get top-M candidates with their similarity scores
+def get_candidates(vectorstore, query, M=5):
+    # returns list of (Document, sim_score)
+    return vectorstore.similarity_search_with_relevance_scores(query, k=M)
+
+# 3) Simulated buyer–value: v_i = sim_i (just take sim of each snippet)
+def evaluate_performance_sim(candidates, k=1):
+    # only top-k actually “used”
+    # we’ll define V = sum of sims of the chosen k
+    sims = [sim for (_, sim) in candidates]
+    return sum(sims[:k])
+
+# 4) Leave‑One‑Out payments
+def loo_payments(query, vectorstore, docs, M=5, k=1):
+    # 1) retrieve full candidate list
+    full_cands = get_candidates(vectorstore, query, M=M)
+    Vf = evaluate_performance_sim(full_cands, k)
+    payments = {}
+    # for each candidate j, remove it and recompute
+    for j_idx, (doc_j, sim_j) in enumerate(full_cands):
+        # build D_minus by dropping position j_idx
+        minus = full_cands[:j_idx] + full_cands[j_idx+1:]
+        Vminus = evaluate_performance_sim(minus, k)
+        payments[doc_j.metadata.get("id", j_idx)] = Vf - Vminus
+    return payments
+
+# 5) Shapley payments (Monte‑Carlo)
+def shapley_payments(query, vectorstore, docs, M=5, k=1, samples=200):
+    full_cands = get_candidates(vectorstore, query, M=M)
+    n = len(full_cands)
+    shap = {doc.metadata.get("id", i): 0.0 for i, (doc, _) in enumerate(full_cands)}
+    for _ in range(samples):
+        perm = full_cands.copy()
+        random.shuffle(perm)
+        Vprev = 0.0
+        prefix = []
+        for (doc_j, sim_j) in perm:
+            prefix_with = prefix + [(doc_j, sim_j)]
+            Vwith = evaluate_performance_sim(prefix_with, k)
+            marginal = Vwith - Vprev
+            idx = doc_j.metadata.get("id")
+            shap[idx] += marginal
+            Vprev = Vwith
+            prefix = prefix_with
+    # average
+    return {j: val/samples for j, val in shap.items()}
+
+# 6) Demo on one query:
+if __name__=="__main__":
+    # load your QA “snippets” as docs with IDs and prices
+    from datasets import load_dataset
+    import pandas as pd
+
+    df = load_dataset("keivalya/MedQuad-MedicalQnADataset", split="train").to_pandas()
+    df["id"] = df.index
+    docs = [Document(page_content=row["Answer"],
+                     metadata={"id": row["id"], "price": random.random()*0.05})
+            for _, row in df.head(500).iterrows()]
+
+    # build index
+    vs = build_vectorstore(docs)
+
+    q = "What is a Sydenham chorea?"
+
+    loo = loo_payments(q, vs, docs, M=5, k=1)
+    shap = shapley_payments(q, vs, docs, M=5, k=1, samples=200)
+
+    print("LOO payments:", loo)
+    print("Shapley payments:", shap)
