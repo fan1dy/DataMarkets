@@ -171,6 +171,6 @@ if __name__ == "__main__":
         judge_scores.append(judge_score)
     df['llm_judge_text']  = judge_texts
     df["llm_judge_score"] = judge_scores
-    df["llm_judge_score"] = (df["llm_judge_score"] / 10) + 1
+    # df["llm_judge_score"] = (df["llm_judge_score"] / 10) + 1
     df.to_csv('data/query_w_llm_generated_ans_with_judge_scores.csv', index=False)
 
