@@ -14,7 +14,9 @@ from langchain_community.vectorstores import FAISS
 import argparse
 from datasets import load_dataset
 import random
+import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..')))
+random.seed(42)
 
 load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
