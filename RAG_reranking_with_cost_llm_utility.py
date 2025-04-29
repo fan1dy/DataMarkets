@@ -331,9 +331,7 @@ if __name__ == "__main__":
     results["doc_ids"] = [int(ele) for ele in doc_ids]
 
     results["query"] = query
-    ret = vs.similarity_search_with_relevance_scores(query, k=1)
-    docs, sims = zip(*ret)
-    results["true_doc_id"] = int(docs[0].metadata["id"])
+    results["true_doc_id"] = record["id"]
 
     myers = myerson_payments(prices, scores, doc_ids)
     print("Myer payments:", myers)
