@@ -210,12 +210,11 @@ def myerson_payments(query: str, true_answer: str, vs: FAISS, M: int = 5, k: int
 
     full = get_candidates(vs, query, M)
     v_single = {}
-    for (doc_j, _) in full:
+    for (doc_j, tmp) in full:
         tmp_vs = FAISS.from_documents([doc_j], embedding=vs.embedding)
         v_single[doc_j.metadata["id"]] = evaluate_performance_judge(query, tmp_vs, k=1)
 
-    utils = {j: v_single[j] - doc.metadata["price"]
-             for doc,j in zip([d for d,tmp in full], v_single.keys())}
+    utils = {j: v_single[j] - doc.metadata["price"] for doc,j in zip([d for d,tmp in full], v_single.keys())}
     sorted_ids = sorted(utils, key=utils.get, reverse=True)
     winners   = sorted_ids[:k]
     threshold = utils[sorted_ids[k]] if len(sorted_ids)>k else 0.0
@@ -223,32 +222,24 @@ def myerson_payments(query: str, true_answer: str, vs: FAISS, M: int = 5, k: int
     return {j: max(0.0, utils[j]-threshold) if j in winners else 0.0 for j in utils}
 
 def vcg_payments(query: str, vs: FAISS, docs: List[Document], M: int = 5,k: int = 1):
-    # 1) top-M by similarity
     cands = get_candidates(vs, query, M) 
     sims   = {doc.metadata["id"]: sim  for doc, sim  in cands}
     costs  = {doc.metadata["id"]: doc.metadata["price"] for doc,_ in cands}
     utils  = {j: sims[j] - costs[j]       for j in sims}
 
-    # 2) rank by utility and pick winners S
     ranked      = sorted(utils.items(), key=lambda x: x[1], reverse=True)
-    winners_ids = [j for j, _ in ranked[:k]]
+    winners_ids = [j for j, tmp in ranked[:k]]
 
-    # 3) precompute sum of "others in S" for each winner
-    sum_others = {
-      j: sum(utils[i] for i in winners_ids if i != j)
-      for j in winners_ids
-    }
+    sum_others = {j: sum(utils[i] for i in winners_ids if i != j) for j in winners_ids}
 
     payments: Dict[int, float] = {}
     for j in utils:
         if j not in winners_ids:
             payments[j] = 0.0
         else:
-            # build the M−1 candidate list without j
             others = [(i, utils[i]) for i in utils if i != j]
-            # re-rank them and take top-k
             best_k = sorted(others, key=lambda x: x[1], reverse=True)[:k]
-            h_j    = sum(u for _, u in best_k)
+            h_j    = sum(u for temp, u in best_k)
             payments[j] = max(0.0, h_j - sum_others[j])
     return payments
 
