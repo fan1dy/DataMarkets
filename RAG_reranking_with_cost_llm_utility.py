@@ -311,7 +311,7 @@ if __name__ == "__main__":
       for _,row in df.iterrows()
     ]
 
-    questionID = 1
+    questionID = 7#1
     record = docs[questionID].metadata
     questions   = generate_questions(record)
     query       = questions[0]
