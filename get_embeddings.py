@@ -20,19 +20,23 @@ load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
 
 # Load embedding model
-data = load_dataset("keivalya/MedQuad-MedicalQnADataset", split='train')
-data = data.to_pandas()
-data["id"]=data.index
-MAX_ROWS = len(data["id"])
-DOCUMENT="Answer"
-TOPIC="qtype"
-subset_data = data.head(MAX_ROWS)
-doc_lists = subset_data["Answer"].tolist()
-price_list = [random.uniform(0, 0.05) for _ in range(MAX_ROWS)]
-docs = [Document(page_content=doc_lists[i], metadata={"price": price_list[i]}) for i in range(len(doc_lists))]
+data_csv = pd.read_csv('data/medquad.csv')
+docs = [
+    Document(
+    page_content=row["answer"],
+    metadata={
+        "id":         int(row["id"]),
+        "price":      random.uniform(0, 0.1),
+        "question":   row["question"],
+        "answer":     row["answer"],
+        "source":     row["source"],
+        "focus_area": row["focus_area"]
+    }
+    )
+    for _,row in data_csv.iterrows() if isinstance(row["answer"], str) 
+    ]
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-# embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
 # Create FAISS vectorstore from documents
 vectorstore = FAISS.from_documents(docs, embedding=embeddings)
 vectorstore.save_local("faiss_index")
