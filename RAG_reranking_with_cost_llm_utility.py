@@ -200,6 +200,9 @@ def get_llm_answer_from_retrieved_doc(retrieved: str, query: str):
     return llm_answer
 
 def loo_payments(prices, scores, doc_ids):
+    """
+    LOO payment is the difference in valuations when seller j is removed from the market.
+    """
     utility =  [scores[i] - prices[i] for i in range(len(prices))]
     idx = utility.index(max(utility))
     v_full = scores[idx]
@@ -210,12 +213,16 @@ def loo_payments(prices, scores, doc_ids):
         prices_tmp.pop(id)
         scores_tmp.pop(id)
         # rebuild tiny index w/o doc_j
-        utility_minus_j = [prices_tmp[i] - scores_tmp[i] for i in range(len(prices_tmp))]
-        payments[doc_ids[id]] = v_full - max(utility_minus_j)
+        utility_minus_j = [-prices_tmp[i] + scores_tmp[i] for i in range(len(prices_tmp))]
+        id_ = utility_minus_j.index(max(utility_minus_j))
+        payments[int(doc_ids[id])] = v_full - scores_tmp[id_]
     return payments
 
 
 def shapley_payments(prices, scores, doc_ids):
+    """
+    LOO payment is the average difference in valuations when seller j is removed from any subset the market.
+    """
     from math import comb
     from itertools import chain, combinations
     utility = [scores[i] - prices[i] for i in range(len(prices))]
@@ -235,8 +242,10 @@ def shapley_payments(prices, scores, doc_ids):
                 subset_plus_j = subset + [id]
                 utility_subset = [utility[i] for i in subset]
                 utility_subset_plus_j = [utility[i] for i in subset_plus_j]
-                Shapley_value += (1/comb(len(doc_ids)-1,len(subset))) * (max(utility_subset_plus_j) - max(utility_subset))
-        payments[doc_ids[id]] = Shapley_value/len(doc_ids)
+                idx1 = subset_plus_j[utility_subset.index(max(utility_subset))]
+                idx2 = subset_plus_j[utility_subset_plus_j.index(max(utility_subset_plus_j))]
+                Shapley_value += (1/comb(len(doc_ids)-1,len(subset))) * (scores[idx2]-scores[idx1])
+        payments[int(doc_ids[id])] = Shapley_value/len(doc_ids)
 
     return payments
 
@@ -244,17 +253,20 @@ def shapley_payments(prices, scores, doc_ids):
 def myerson_payments(prices, scores, doc_ids):
     payments: Dict[int, float] = {}
     for id in doc_ids:
-        payments[id] = 0.0
+        payments[int(id)] = 0.0
     utility =  [scores[i] - prices[i] for i in range(len(prices))]
     idx = utility.index(max(utility))
     cj = prices[idx]
     # now calculate the residual part
     sorted_utility = sorted(utility, reverse=True)
-    res = sorted_utility[0] -sorted_utility[1]
-    payments[doc_ids[idx]] =  res+cj
+    res = sorted_utility[0] -sorted_utility[1] - cj
+    payments[int(doc_ids[idx])] =  res + cj
     return payments
 
 def vcg_payments(prices, scores, doc_ids):
+    """
+    VCG payment is the average difference in utlities when seller j is removed from any subset the market.
+    """
     payments: Dict[int, float] = {}
     utility =  [scores[i] - prices[i] for i in range(len(prices))]
     idx = utility.index(max(utility))
@@ -263,7 +275,7 @@ def vcg_payments(prices, scores, doc_ids):
         utility_tmp = utility.copy()
         utility_tmp.pop(id)
         sorted_utility_minus_j = sorted(utility_tmp, reverse=True)
-        payments[doc_ids[id]] = max_u - sorted_utility_minus_j[0] 
+        payments[int(doc_ids[id])] = max_u - sorted_utility_minus_j[0] 
     return payments
 
 
@@ -311,7 +323,17 @@ if __name__ == "__main__":
 
     vs = build_vectorstore(docs)
     print("\nRAG Retrieval")
-    prices, scores, doc_ids = rag_run(query, vs, top_n=1)
+    prices, scores, doc_ids = rag_run(query, vs, top_n=1,initial_docs=10)
+
+    results = {}
+    results["prices"] = [float(ele) for ele in prices]
+    results["scores"] = [float(ele) for ele in scores]
+    results["doc_ids"] = [int(ele) for ele in doc_ids]
+
+    results["query"] = query
+    ret = vs.similarity_search_with_relevance_scores(query, k=1)
+    docs, sims = zip(*ret)
+    results["true_doc_id"] = int(docs[0].metadata["id"])
 
     myers = myerson_payments(prices, scores, doc_ids)
     print("Myer payments:", myers)
@@ -321,43 +343,11 @@ if __name__ == "__main__":
     print("LOO payments:", loo)
     shap= shapley_payments(prices, scores, doc_ids)
     print("Shapley payments:", shap)
+
+    results["Myerson"] = myers
+    results["VCG"] = vcg
+    results["LOO"] = loo
+    results["Shapley"] = shap
     
-
-    #real_v = evaluate_performance_judge(query, true_answer, vs, k=args.loo_k)
-    #VCG payment
-
-    # print("\n Simulated Payments")
-    # print("VCG payments:", vcg)
-    # print("LOO payments:", loo)
-    # print("Shapley payments:", shap)
-    # print("Myer payments:", myers)
-
-    #insert plot, different x values, which is reported price that maximizes sellers utility. follow from the Figure 1
-
-    # from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    # model_id = "Qwen/Qwen2.5-3B"
-    # tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # model = AutoModelForCausalLM.from_pretrained(model_id,
-    #                                             device_map=device,
-    #                                             torch_dtype=torch.bfloat16)
-    # question_def = "Write in 20 words what is a Sydenham chorea."
-    # results = rag_run(query="Write in 20 words what is a Sydenham chorea.", docs=docs)
-    # prompt_template = f"Relevant context: {results}\n\n The user's question: {question_def}"
-
-    # print("++++++++++++++ with RAG")
-
-    # input_ids_w_context = tokenizer(prompt_template, return_tensors="pt").to(device)
-    # outputs = model.generate(**input_ids_w_context,
-    #                         max_new_tokens=256)
-    # print(tokenizer.decode(outputs[0])) #answer from Qwen
-
-    # judge this answer from high end LLM
-
-
-    # print("++++++++++++++ without RAG")
-
-    # input_ids = tokenizer(f"The user's question: {question_def}", return_tensors="pt").to(device)
-    # outputs = model.generate(**input_ids,
-    #                         max_new_tokens=256)
-    # print(tokenizer.decode(outputs[0]))
+    with open("res.json", "w") as f:
+        json.dump(results, f, indent=4)  # `indent=4` makes it nicely formatted
