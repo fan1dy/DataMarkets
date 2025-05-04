@@ -11,55 +11,77 @@ from tqdm import tqdm
 from together import Together
 import pandas as pd
 import openai
-
+from langchain_community.vectorstores import FAISS
 from typing import List, Any
 from pydantic import BaseModel, Field
 from datasets import load_dataset
 
 from langchain.docstore.document import Document
 from langchain_openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+
 from langchain_core.retrievers import BaseRetriever
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from sentence_transformers import SentenceTransformer, util
 
 #with open(".env", "w") as f:
 #  f.write("API Key")
-from dotenv import load_dotenv
-import os
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from torch import cuda
+
+import numpy as np
+
+# fix random seed for reproducibility
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)          # For single-GPU
+torch.cuda.manual_seed_all(42)  
+
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+print("use device:", device)
 load_dotenv()
-os.environ["OPENAI_API_KEY"] ="insert key"
-os.environ["TOGETHER_API_KEY"] = "insert key"
+os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+os.environ["TOGETHER_API_KEY"] = os.getenv('TOGETHER_API_KEY')
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-API_KEY = os.getenv("TOGETHER_API_KEY")
-client = Together(api_key=API_KEY, timeout=10)
+client = Together() 
+model_id = "Qwen/Qwen2.5-3B"
 
 
-prompt_template = """
-You emulate a user of our medical QA system.
-Formulate 4 questions this user might ask based on a provided disease record.
-Make them specific to this disease. Use as few words as possible from the record.
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id,
+                                            device_map=device,
+                                            torch_dtype=torch.bfloat16)
+
+INDEX_DIR  = "/iopsstor/scratch/cscs/dfan/RAG/DataMarkets-proj/faiss_index" # change it to your local faiss path
+
+question_prompt_template =  """
+You emulate a user of our medical question answering application.
+Formulate 4 questions this user might ask based on a provided disease.
+Make the questions specific to this disease.
+The record should contain the answer to the questions, and the questions should
+be complete and not too short. Use as few words as possible from the record. 
 
 The record:
+
 question: {question}
 answer: {answer}
 source: {source}
 focus_area: {focus_area}
 
-Return JSON:
-{{"questions": ["q1","q2","q3","q4"]}}
+Provide the output in parsable JSON without using code blocks:
+
+{{"questions": ["question1", "question2", ..., "question4"]}}
 """.strip()
 
 def generate_questions(record: Dict[str,Any]) -> List[str]:
+
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content": prompt_template.format(**record)}],
+        messages=[{"role":"user","content": question_prompt_template.format(**record)}],
         temperature=0
     )
-    return json.loads(resp.choices[0].message.content)["questions"]
-
+    questions = json.loads(resp.choices[0].message.content)["questions"]
+    return questions 
 
 class RatingScore(BaseModel):
     relevance_score: float = Field(..., description="The relevance score of a document to a query.")
@@ -70,43 +92,48 @@ def rerank_documents(docs: List[Document], scores: List[float], top_n: int = 1) 
     ranked = sorted(zip(docs, utilities), key=lambda x: x[1], reverse=True)
     return [doc for doc,_ in ranked[:top_n]]
 
+def rerank_documents_with_LLM(docs: List[Document], scores: List[float], query: str, top_n: int = 1) -> List[Document]:
+    """Utility = LLM score - price reranking; return top_n Documents."""
+    scores = [evaluate_performance_judge(query, docs[i].page_content, k=1) for i in range(len(docs))]
+    prices = [docs[i].metadata["price"] for i in range(len(docs))]
+    utilities = [scores[i] - docs[i].metadata["price"] for i in range(len(docs))]
+    ranked = sorted(zip(docs, utilities), key=lambda x: x[1], reverse=True)
+    doc_ids = [doc.metadata["id"] for doc in docs]
+    print("prices:", [docs[i].metadata["price"] for i in range(len(docs))])
+    print("scores:",scores)
+    return prices, scores, doc_ids
+
 class CustomRetriever(BaseRetriever, BaseModel):
     vectorstore: Any = Field(description="Vector store for initial retrieval")
     class Config:
         arbitrary_types_allowed = True
 
-    def _get_relevant_documents(self, query: str, num_docs: int = 1) -> List[Document]:
-        initial = self.vectorstore.similarity_search_with_relevance_scores(query, k=10)
+    def _get_relevant_documents(self, query: str, num_docs: int = 1, initial_docs: int=10) -> List[Document]:
+        initial = self.vectorstore.similarity_search_with_relevance_scores(query,
+                                                                        k=initial_docs)
         docs, sims = zip(*initial)
-        print("Raw sims:", sims)
-        return rerank_documents(list(docs), list(sims), top_n=num_docs)
+        return rerank_documents_with_LLM(list(docs), list(sims), query, top_n=num_docs)
 
-def rag_run(query: str, docs: List[Document], top_n: int = 1):
-    INDEX_DIR  = "faiss_index"
-    embed = OpenAIEmbeddings(model="text-embedding-3-large")
 
-    if os.path.isdir(INDEX_DIR):
-        # Load the existing FAISS index
-        vectorstore = FAISS.load_local(INDEX_DIR, embed, allow_dangerous_deserialization=True)
-        print(f"Loaded FAISS index from {INDEX_DIR}")
-    else:
+def rag_run(query: str, vs: FAISS, top_n: int = 1, initial_docs = 10):
 
-        vectorstore = FAISS.from_documents(docs, embedding=embed)
-        vectorstore.save_local(INDEX_DIR)
-        print(f"Saved FAISS index to {INDEX_DIR}")
+    retriever = CustomRetriever(vectorstore=vs)
+    return retriever._get_relevant_documents(query, num_docs=top_n, initial_docs=initial_docs)
 
-    vectorstore.embedding = embed
-
-    retriever  = CustomRetriever(vectorstore=vectorstore)
-    return retriever._get_relevant_documents(query, num_docs=top_n)
+def answer_with_context(query: str, docs: List[Document]) -> str:
+    ctx = "\n\n".join(d.page_content for d in docs)
+    prompt = f"Relevant context:\n{ctx}\n\nQuestion: {query}\nAnswer (brief):"
+    input_ids = tokenizer(prompt, return_tensors="pt").to(device)
+    out = model.generate(**input_ids, max_new_tokens=256)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
 
 def build_vectorstore(docs: List[Document]) -> FAISS:
     embed = OpenAIEmbeddings(model="text-embedding-3-large")
-    if os.path.isdir("my_index"):
-        vs = FAISS.load_local("my_index", embed, allow_dangerous_deserialization=True)
+    if os.path.isdir(INDEX_DIR):
+        vs = FAISS.load_local(INDEX_DIR, embed, allow_dangerous_deserialization=True)
     else:
         vs = FAISS.from_documents(docs, embedding=embed)
-        vs.save_local("my_index")
+        vs.save_local(INDEX_DIR)
     vs.embedding = embed
     return vs
 
@@ -121,7 +148,9 @@ def extract_judge_score(answer: str, split_str: str = "Total rating:") -> float:
         return 0.0
     return float(m.group(1))
 
-def evaluate_performance_judge(question: str, vs: FAISS, k: int = 1, model: str = "deepseek-ai/DeepSeek-R1"):
+def evaluate_performance_judge(question: str, retrived: str, k: int = 1, model: str = "deepseek-ai/DeepSeek-R1"):
+    # generate answer based on the retrieced doc first
+    answer = get_llm_answer_from_retrieved_doc(retrived, question)
     JdgPrompt="""
     You will be given a user_question and system_answer couple.
     Your task is to provide a 'total rating' scoring how well the system_answer answers the user concerns expressed in the user_question.
@@ -140,10 +169,7 @@ def evaluate_performance_judge(question: str, vs: FAISS, k: int = 1, model: str 
     Feedback:::
     Total rating: """
 
-    docs_and_sims = vs.similarity_search_with_relevance_scores(question, k=k)
-    snippet, temp = docs_and_sims[0]
-
-    prompt = JdgPrompt.format(question=question, answer=snippet.page_content)
+    prompt = JdgPrompt.format(question=question, answer=answer)
 
     '''resp = together.chat.completions.create(
         model=model,
@@ -152,10 +178,11 @@ def evaluate_performance_judge(question: str, vs: FAISS, k: int = 1, model: str 
         timeout=20
     )'''
 
-    models = client.models.list() 
+    # models = client.models.list() 
 
     resp = client.chat.completions.create(
-        model=models[0].id,
+        # model=models[0].id,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         timeout = 30,
         max_retries = 2
@@ -166,81 +193,94 @@ def evaluate_performance_judge(question: str, vs: FAISS, k: int = 1, model: str 
     raw_score = extract_judge_score(judge_text)   # e.g. “7.5”
     if raw_score is None:
         return 0.0
+    print("Judge response:", raw_score)
     return float(raw_score) / 10.0  # now in [0,1]
 
+def get_llm_answer_from_retrieved_doc(retrieved: str, query: str):
+    prompt_template = f"Relevant context: {retrieved}\n\n The user's question: {query}"
+    input_ids_w_context = tokenizer(prompt_template, return_tensors="pt").to(device)
+    outputs = model.generate(**input_ids_w_context,
+                            max_new_tokens=256)
+    llm_answer = tokenizer.decode(outputs[0])
+    return llm_answer
 
-def loo_payments(query: str, true_answer: str, vs: FAISS, docs: List[Document], M: int = 5, k: int = 1):
-    V_full = evaluate_performance_judge(query, vs, k=k)
-
-    full = get_candidates(vs, query, M)
-    docs_M = [doc for doc,_ in full]
-
+def loo_payments(prices, scores, doc_ids):
+    """
+    LOO payment is the difference in valuations when seller j is removed from the market.
+    """
+    utility =  [scores[i] - prices[i] for i in range(len(prices))]
+    idx = utility.index(max(utility))
+    v_full = scores[idx]
     payments: Dict[int, float] = {}
-    for idx, (doc_j, _) in enumerate(full):
+    for id in range(len(doc_ids)):
+        prices_tmp = prices.copy()
+        scores_tmp = scores.copy()
+        prices_tmp.pop(id)
+        scores_tmp.pop(id)
         # rebuild tiny index w/o doc_j
-        minus_docs = [d for d in docs_M if d.metadata["id"] != doc_j.metadata["id"]]
-        temp_vs = FAISS.from_documents(minus_docs, embedding=vs.embedding)
-        V_minus = evaluate_performance_judge(query, temp_vs, k=k)
-        payments[doc_j.metadata["id"]] = V_full - V_minus
+        utility_minus_j = [-prices_tmp[i] + scores_tmp[i] for i in range(len(prices_tmp))]
+        id_ = utility_minus_j.index(max(utility_minus_j))
+        payments[int(doc_ids[id])] = v_full - scores_tmp[id_]
+    return payments
+
+
+def shapley_payments(prices, scores, doc_ids):
+    """
+    LOO payment is the average difference in valuations when seller j is removed from any subset the market.
+    """
+    from math import comb
+    from itertools import chain, combinations
+    utility = [scores[i] - prices[i] for i in range(len(prices))]
+    payments: Dict[int, float] = {}
+    elements = list(range(len(doc_ids)))
+
+    def all_subsets(iterable):
+        return chain.from_iterable(combinations(iterable, r) for r in range(len(iterable) + 1))
+    
+    for id in range(len(doc_ids)):
+        elements_tmp = elements.copy()
+        elements_tmp.pop(id)
+        subsets = list(map(list, all_subsets(elements_tmp)))
+        Shapley_value = 0
+        for subset in subsets:
+            if len(subset) >0:
+                subset_plus_j = subset + [id]
+                utility_subset = [utility[i] for i in subset]
+                utility_subset_plus_j = [utility[i] for i in subset_plus_j]
+                idx1 = subset_plus_j[utility_subset.index(max(utility_subset))]
+                idx2 = subset_plus_j[utility_subset_plus_j.index(max(utility_subset_plus_j))]
+                Shapley_value += (1/comb(len(doc_ids)-1,len(subset))) * (scores[idx2]-scores[idx1])
+        payments[int(doc_ids[id])] = Shapley_value/len(doc_ids)
 
     return payments
 
 
-def shapley_payments(query: str, true_answer: str, vs: FAISS, docs: List[Document], M: int = 5, k: int = 1, samples: int = 200):
-    full = get_candidates(vs, query, M)
-    shap = {doc.metadata["id"]: 0.0 for doc,_ in full}
-
-    for tmp in range(samples):
-        perm = full.copy()
-        random.shuffle(perm)
-        V_prev = 0.0
-        prefix_docs: List[Document] = []
-
-        for doc_j, temp in perm:
-            prefix_docs.append(doc_j)
-            temp_vs = FAISS.from_documents(prefix_docs, embedding=vs.embedding)
-            V_with = evaluate_performance_judge(query, temp_vs, k=k)
-            shap[doc_j.metadata["id"]] += (V_with - V_prev)
-            V_prev = V_with
-
-    return {j: shap[j] / samples for j in shap} #Dict[int, float]
-
-
-def myerson_payments(query: str, true_answer: str, vs: FAISS, M: int = 5, k: int = 1):
-
-    full = get_candidates(vs, query, M)
-    v_single = {}
-    for (doc_j, tmp) in full:
-        tmp_vs = FAISS.from_documents([doc_j], embedding=vs.embedding)
-        v_single[doc_j.metadata["id"]] = evaluate_performance_judge(query, tmp_vs, k=1)
-
-    utils = {j: v_single[j] - doc.metadata["price"] for doc,j in zip([d for d,tmp in full], v_single.keys())}
-    sorted_ids = sorted(utils, key=utils.get, reverse=True)
-    winners   = sorted_ids[:k]
-    threshold = utils[sorted_ids[k]] if len(sorted_ids)>k else 0.0
-
-    return {j: max(0.0, utils[j]-threshold) if j in winners else 0.0 for j in utils}
-
-def vcg_payments(query: str, vs: FAISS, docs: List[Document], M: int = 5,k: int = 1):
-    cands = get_candidates(vs, query, M) 
-    sims   = {doc.metadata["id"]: sim  for doc, sim  in cands}
-    costs  = {doc.metadata["id"]: doc.metadata["price"] for doc,_ in cands}
-    utils  = {j: sims[j] - costs[j]       for j in sims}
-
-    ranked      = sorted(utils.items(), key=lambda x: x[1], reverse=True)
-    winners_ids = [j for j, tmp in ranked[:k]]
-
-    sum_others = {j: sum(utils[i] for i in winners_ids if i != j) for j in winners_ids}
-
+def myerson_payments(prices, scores, doc_ids):
     payments: Dict[int, float] = {}
-    for j in utils:
-        if j not in winners_ids:
-            payments[j] = 0.0
-        else:
-            others = [(i, utils[i]) for i in utils if i != j]
-            best_k = sorted(others, key=lambda x: x[1], reverse=True)[:k]
-            h_j    = sum(u for temp, u in best_k)
-            payments[j] = max(0.0, h_j - sum_others[j])
+    for id in doc_ids:
+        payments[int(id)] = 0.0
+    utility =  [scores[i] - prices[i] for i in range(len(prices))]
+    idx = utility.index(max(utility))
+    cj = prices[idx]
+    # now calculate the residual part
+    sorted_utility = sorted(utility, reverse=True)
+    res = sorted_utility[0] -sorted_utility[1] - cj
+    payments[int(doc_ids[idx])] =  res + cj
+    return payments
+
+def vcg_payments(prices, scores, doc_ids):
+    """
+    VCG payment is the average difference in utlities when seller j is removed from any subset the market.
+    """
+    payments: Dict[int, float] = {}
+    utility =  [scores[i] - prices[i] for i in range(len(prices))]
+    idx = utility.index(max(utility))
+    max_u = utility[idx]
+    for id in range(len(doc_ids)):
+        utility_tmp = utility.copy()
+        utility_tmp.pop(id)
+        sorted_utility_minus_j = sorted(utility_tmp, reverse=True)
+        payments[int(doc_ids[id])] = max_u - sorted_utility_minus_j[0] 
     return payments
 
 
@@ -255,105 +295,122 @@ def parse_args():
     args, _ = parser.parse_known_args()
     return args
 
+two_doc_prompt_template = """
+You have an original user question:
+{user_question}
+
+And here are *two* disease records:
+
+Record 1:
+ question: {question1}
+ answer: {answer1}
+ source: {source1}
+ focus_area: {focus_area1}
+
+Record 2:
+ question: {question2}
+ answer: {answer2}
+ source: {source2}
+ focus_area: {focus_area2}
+
+Please write *one* concise follow-up question that best addresses both records.
+Return *only* that question (no extra JSON or explanation).
+""".strip()
+
+def generate_two_doc_question(rec: Dict[str, str]) -> str:
+    resp = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content": two_doc_prompt_template.format(**rec)}],
+        temperature=0
+    )
+    return resp.choices[0].message.content.strip()
+
 
 if __name__ == "__main__":
     args = parse_args()
-
-    ds = load_dataset("keivalya/MedQuad-MedicalQnADataset")
-    df = ds["train"].to_pandas().reset_index()
-    df.rename(columns={"index":"id"},inplace=True)
-
+    df = pd.read_csv('medquad.csv')
+    # df = pd.read_csv('../DataMarkets-proj/data/medquad.csv')
+    df = df.sample(n=50)
     docs = [
       Document(
-        page_content=row["Answer"],
+        page_content=row["answer"],
         metadata={
           "id":         int(row["id"]),
           "price":      random.random()*0.05,
-          "question":   row["Question"],
-          "answer":     row["Answer"],
-          "source":     row.get("Source",""),
-          "focus_area": row.get("Topic","")
+          "question":   row["question"],
+          "answer":     row["answer"],
+          "source":     row.get("source",""),
+          "focus_area": row.get("focus_area","")
         }
       )
       for _,row in df.iterrows()
     ]
-    #ds = load_dataset("pubmed_qa", "pqa_labeled", split="test")
-    #docs = [
-    #    Document(
-    #        page_content=ds[i]["context"],
-    #        metadata={
-    #            "id": i,
-    #            "price": random.random() * 0.05,
-    #            "true_answer": "yes" if ds[i]["label"] == 1 else "no"
-    #        }
-    #    )
-    #    for i in range(len(ds))
-    #]
 
-    questionID = 7368
+    questionID = 7
     record = docs[questionID].metadata
-    questions   = generate_questions(record)
-    query       = questions[0]
+
+    seed_q = record["question"]
+
+    vs = build_vectorstore(docs)
+    seed_cands = vs.similarity_search_with_relevance_scores(seed_q, k=2)
+    docs_two   = [doc for doc,_ in seed_cands]  # two Document objects
+
+    combined = {
+      "user_question": seed_q,
+      "question1":    docs_two[0].metadata["question"],
+      "answer1":    docs_two[0].page_content,
+      "source1":    docs_two[0].metadata.get("source",""),
+      "focus_area1":docs_two[0].metadata.get("focus_area",""),
+
+      "question2":  docs_two[1].metadata["question"],
+      "answer2":    docs_two[1].page_content,
+      "source2":    docs_two[1].metadata.get("source",""),
+      "focus_area2":docs_two[1].metadata.get("focus_area",""),
+    }
+
+    query = generate_two_doc_question(combined)
     true_answer = record["answer"]
 
     print(f"question: {query!r}")
-    print(f"Ground-truth answer: {true_answer!r}")
+    print(f"Ground-truth doc: {true_answer!r}")
+
 
     print("\nRAG Retrieval")
-    retrieved = rag_run(query, docs, top_n=1)
-    for doc in retrieved:
-        print("Retrieved snippet:", doc.page_content[:200], "…")
+    prices, scores, doc_ids = rag_run(query, vs, top_n=2, initial_docs=10)
 
-    '''true_ans = next(doc.metadata["true_answer"]
-                    for doc in docs if doc.metadata["id"] == questionID)
+    results = {}
+    results["prices"] = [float(ele) for ele in prices]
+    results["scores"] = [float(ele) for ele in scores]
+    results["doc_ids"] = [int(ele) for ele in doc_ids]
 
-    loo  = loo_payments_mcq(args.query, true_ans, vs, M=args.num_snippets, k=args.loo_k)
-    shap = shapley_payments_mcq(args.query, true_ans, vs, M=args.num_snippets, k=args.loo_k, samples=args.shap_samples)
-    myer = myerson_payments_mcq(args.query, true_ans, vs, M=args.num_snippets, k=args.loo_k)'''
+    results["query"] = query
+    results["true_doc_id"] = record["id"]
 
-    vs = build_vectorstore(docs)
-
-    myers = myerson_payments(query, true_answer, vs, M=args.num_snippets, k=args.loo_k)
-    vcg = vcg_payments(query, vs, docs, M=args.num_snippets, k=args.loo_k)
-    loo = loo_payments(query, true_answer, vs, docs, M=args.num_snippets, k=args.loo_k)
-    shap= shapley_payments(query, true_answer,vs, docs, M=args.num_snippets, k=args.loo_k, samples=args.shap_samples)
-    
-
-    #real_v = evaluate_performance_judge(query, true_answer, vs, k=args.loo_k)
-    #VCG payment
-
-    print("\n Simulated Payments")
-    print("VCG payments:", vcg)
-    print("LOO payments:", loo)
-    print("Shapley payments:", shap)
+    myers = myerson_payments(prices, scores, doc_ids)
     print("Myer payments:", myers)
+    vcg = vcg_payments(prices, scores, doc_ids)
+    print("VCG payments:", vcg)
+    loo = loo_payments(prices, scores, doc_ids)
+    print("LOO payments:", loo)
+    shap= shapley_payments(prices, scores, doc_ids)
+    print("Shapley payments:", shap)
 
-    #insert plot, different x values, which is reported price that maximizes sellers utility. follow from the Figure 1
+    results["Myerson"] = myers
+    results["VCG"] = vcg
+    results["LOO"] = loo
+    results["Shapley"] = shap
 
-    # from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    # model_id = "Qwen/Qwen2.5-3B"
-    # tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # model = AutoModelForCausalLM.from_pretrained(model_id,
-    #                                             device_map=device,
-    #                                             torch_dtype=torch.bfloat16)
-    # question_def = "Write in 20 words what is a Sydenham chorea."
-    # results = rag_run(query="Write in 20 words what is a Sydenham chorea.", docs=docs)
-    # prompt_template = f"Relevant context: {results}\n\n The user's question: {question_def}"
-
-    # print("++++++++++++++ with RAG")
-
-    # input_ids_w_context = tokenizer(prompt_template, return_tensors="pt").to(device)
-    # outputs = model.generate(**input_ids_w_context,
-    #                         max_new_tokens=256)
-    # print(tokenizer.decode(outputs[0])) #answer from Qwen
-
-    # judge this answer from high end LLM
-
-
-    # print("++++++++++++++ without RAG")
-
-    # input_ids = tokenizer(f"The user's question: {question_def}", return_tensors="pt").to(device)
-    # outputs = model.generate(**input_ids,
-    #                         max_new_tokens=256)
-    # print(tokenizer.decode(outputs[0]))
+    results = {
+    "query": query,
+    "true_doc_id":int(record["id"]),
+    "prices": [float(p) for p in prices],
+    "scores": [float(s) for s in scores],
+    "doc_ids": [int(i) for i in doc_ids],
+    "Myerson":{int(k): float(v) for k, v in myers.items()},
+    "VCG":{int(k): float(v) for k, v in vcg.items()},
+    "LOO":{int(k): float(v) for k, v in loo.items()},
+    "Shapley": {int(k): float(v) for k, v in shap.items()},
+  }
+    
+    with open("res.json", "w") as f:
+        json.dump(results, f, indent=4)  # `indent=4` makes it nicely formatted
